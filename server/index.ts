@@ -227,6 +227,8 @@ app.options("*", (c) => c.text("ok", 200, corsHeaders));
 
 app.use("*", authMiddleware);
 
+app.get("/", (c) => c.json({ status: "ok", service: "Open Brain Core", version: "1.0.0" }));
+
 app.all("*", async (c) => {
   // Fix: Claude Desktop connectors don't send the Accept header that
   // StreamableHTTPTransport requires. Build a patched request if missing.
