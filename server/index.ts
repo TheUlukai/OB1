@@ -225,6 +225,13 @@ const app = new Hono();
 // CORS preflight — required for browser/Electron-based clients (Claude Desktop, claude.ai)
 app.options("*", (c) => c.text("ok", 200, corsHeaders));
 
+app.use("*", async (c, next) => {
+  console.log(`[${new Date().toISOString()}] ${c.req.method} ${c.req.url}`);
+  console.log(`  headers: ${JSON.stringify(Object.fromEntries(c.req.raw.headers))}`);
+  await next();
+  console.log(`  -> ${c.res.status}`);
+});
+
 app.use("*", authMiddleware);
 
 app.get("/", (c) => c.json({ status: "ok", service: "Open Brain Core", version: "1.0.0" }));
