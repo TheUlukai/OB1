@@ -234,7 +234,30 @@ app.use("*", async (c, next) => {
 
 app.use("*", authMiddleware);
 
-app.get("/", (c) => c.json({ status: "ok", service: "Open Brain Core", version: "1.0.0" }));
+app.get("*", (c) => {
+  // SSE transport: Claude Code (SSH/headless) sends GET with Accept: text/event-stream
+  // to establish a server-sent-events channel for server-initiated messages.
+  // Return a persistent SSE stream with keep-alive pings so the connection stays open
+  // and Claude Code proceeds to POST the MCP initialize request.
+  if (c.req.header("accept")?.includes("text/event-stream")) {
+    const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>();
+    const writer = writable.getWriter();
+    const enc = new TextEncoder();
+    writer.write(enc.encode(": connected\n\n"));
+    const ping = setInterval(() => {
+      writer.write(enc.encode(": ping\n\n")).catch(() => clearInterval(ping));
+    }, 15000);
+    return new Response(readable, {
+      headers: {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        ...corsHeaders,
+      },
+    });
+  }
+  return c.json({ status: "ok", service: "Open Brain Core", version: "1.0.0" });
+});
 
 app.all("*", async (c) => {
   // Fix: Claude Desktop connectors don't send the Accept header that
