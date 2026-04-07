@@ -1,310 +1,175 @@
-/**
- * Extension 1: Household Knowledge Base MCP Server
- *
- * Provides tools for storing and retrieving household facts:
- * - Household items (paint colors, appliances, measurements, etc.)
- * - Vendor contacts (service providers)
- */
-
 import { Hono } from "hono";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPTransport } from "@hono/mcp";
 import { z } from "zod";
-import { createClient } from "@supabase/supabase-js";
+import postgres from "npm:postgres@3.4.5";
+import { authMiddleware } from "../../lib/auth.ts";
 
+const sql = postgres(
+  Deno.env.get("DATABASE_URL") ??
+    "postgresql://openbrain:changeme@localhost:5432/openbrain"
+);
+const DEFAULT_USER_ID = Deno.env.get("DEFAULT_USER_ID") ?? "default";
+
+const server = new McpServer({ name: "household-knowledge", version: "1.0.0" });
+
+server.registerTool(
+  "add_household_item",
+  {
+    title: "Add Household Item",
+    description: "Add a new household item (paint color, appliance, measurement, document, etc.)",
+    inputSchema: {
+      name: z.string().describe("Name or description of the item"),
+      category: z.string().optional().describe("Category (e.g. 'paint', 'appliance', 'measurement')"),
+      location: z.string().optional().describe("Location in the home (e.g. 'Living Room', 'Kitchen')"),
+      details: z.string().optional().describe("Flexible metadata as JSON string"),
+      notes: z.string().optional(),
+    },
+  },
+  async ({ name, category, location, details, notes }) => {
+    try {
+      let detailsJson: Record<string, unknown> = {};
+      if (details) { try { detailsJson = JSON.parse(details); } catch { /* keep empty */ } }
+      const [row] = await sql`
+        INSERT INTO household_items (user_id, name, category, location, details, notes)
+        VALUES (${DEFAULT_USER_ID}, ${name}, ${category ?? null}, ${location ?? null},
+                ${JSON.stringify(detailsJson)}, ${notes ?? null})
+        RETURNING *
+      `;
+      return { content: [{ type: "text" as const, text: JSON.stringify({ success: true, item: row }, null, 2) }] };
+    } catch (e) {
+      return { content: [{ type: "text" as const, text: JSON.stringify({ success: false, error: (e as Error).message }) }], isError: true };
+    }
+  }
+);
+
+server.registerTool(
+  "search_household_items",
+  {
+    title: "Search Household Items",
+    description: "Search household items by name, category, or location",
+    inputSchema: {
+      query: z.string().optional().describe("Search term (name, category, location, notes)"),
+      category: z.string().optional(),
+      location: z.string().optional(),
+    },
+  },
+  async ({ query, category, location }) => {
+    try {
+      const rows = await sql`
+        SELECT * FROM household_items
+        WHERE user_id = ${DEFAULT_USER_ID}
+          AND (${category ?? null} IS NULL OR category ILIKE ${"%" + (category ?? "") + "%"})
+          AND (${location ?? null} IS NULL OR location ILIKE ${"%" + (location ?? "") + "%"})
+          AND (${query ?? null} IS NULL OR (
+                name     ILIKE ${"%" + (query ?? "") + "%"} OR
+                category ILIKE ${"%" + (query ?? "") + "%"} OR
+                location ILIKE ${"%" + (query ?? "") + "%"} OR
+                notes    ILIKE ${"%" + (query ?? "") + "%"}
+              ))
+        ORDER BY created_at DESC
+      `;
+      return { content: [{ type: "text" as const, text: JSON.stringify({ success: true, count: rows.length, items: rows }, null, 2) }] };
+    } catch (e) {
+      return { content: [{ type: "text" as const, text: JSON.stringify({ success: false, error: (e as Error).message }) }], isError: true };
+    }
+  }
+);
+
+server.registerTool(
+  "get_item_details",
+  {
+    title: "Get Item Details",
+    description: "Get full details of a specific household item by ID",
+    inputSchema: { item_id: z.string().describe("Item ID (UUID)") },
+  },
+  async ({ item_id }) => {
+    try {
+      const [row] = await sql`SELECT * FROM household_items WHERE id = ${item_id} AND user_id = ${DEFAULT_USER_ID}`;
+      if (!row) throw new Error("Item not found");
+      return { content: [{ type: "text" as const, text: JSON.stringify({ success: true, item: row }, null, 2) }] };
+    } catch (e) {
+      return { content: [{ type: "text" as const, text: JSON.stringify({ success: false, error: (e as Error).message }) }], isError: true };
+    }
+  }
+);
+
+server.registerTool(
+  "add_vendor",
+  {
+    title: "Add Vendor",
+    description: "Add a service provider (plumber, electrician, landscaper, etc.)",
+    inputSchema: {
+      name: z.string(),
+      service_type: z.string().optional(),
+      phone: z.string().optional(),
+      email: z.string().optional(),
+      website: z.string().optional(),
+      notes: z.string().optional(),
+      rating: z.number().min(1).max(5).optional(),
+      last_used: z.string().optional().describe("YYYY-MM-DD"),
+    },
+  },
+  async ({ name, service_type, phone, email, website, notes, rating, last_used }) => {
+    try {
+      const [row] = await sql`
+        INSERT INTO household_vendors (user_id, name, service_type, phone, email, website, notes, rating, last_used)
+        VALUES (${DEFAULT_USER_ID}, ${name}, ${service_type ?? null}, ${phone ?? null},
+                ${email ?? null}, ${website ?? null}, ${notes ?? null},
+                ${rating ?? null}, ${last_used ?? null})
+        RETURNING *
+      `;
+      return { content: [{ type: "text" as const, text: JSON.stringify({ success: true, vendor: row }, null, 2) }] };
+    } catch (e) {
+      return { content: [{ type: "text" as const, text: JSON.stringify({ success: false, error: (e as Error).message }) }], isError: true };
+    }
+  }
+);
+
+server.registerTool(
+  "list_vendors",
+  {
+    title: "List Vendors",
+    description: "List service providers, optionally filtered by service type",
+    inputSchema: { service_type: z.string().optional() },
+  },
+  async ({ service_type }) => {
+    try {
+      const rows = await sql`
+        SELECT * FROM household_vendors
+        WHERE user_id = ${DEFAULT_USER_ID}
+          AND (${service_type ?? null} IS NULL OR service_type ILIKE ${"%" + (service_type ?? "") + "%"})
+        ORDER BY name ASC
+      `;
+      return { content: [{ type: "text" as const, text: JSON.stringify({ success: true, count: rows.length, vendors: rows }, null, 2) }] };
+    } catch (e) {
+      return { content: [{ type: "text" as const, text: JSON.stringify({ success: false, error: (e as Error).message }) }], isError: true };
+    }
+  }
+);
+
+const corsHeaders = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Headers": "content-type, x-brain-key, accept, mcp-session-id",
+  "Access-Control-Allow-Methods": "GET, POST, OPTIONS, DELETE",
+};
 const app = new Hono();
-
+app.options("*", (c) => c.text("ok", 200, corsHeaders));
+app.use("*", authMiddleware);
 app.post("*", async (c) => {
-  // Fix: Claude Desktop connectors don't send the Accept header that
-  // StreamableHTTPTransport requires. Build a patched request if missing.
   if (!c.req.header("accept")?.includes("text/event-stream")) {
     const headers = new Headers(c.req.raw.headers);
     headers.set("Accept", "application/json, text/event-stream");
     const patched = new Request(c.req.raw.url, {
-      method: c.req.raw.method,
-      headers,
-      body: c.req.raw.body,
+      method: c.req.raw.method, headers, body: c.req.raw.body,
       // @ts-ignore -- duplex required for streaming body in Deno
       duplex: "half",
     });
     Object.defineProperty(c.req, "raw", { value: patched, writable: true });
   }
-
-
-  const key = c.req.query("key") || c.req.header("x-access-key");
-  const expected = Deno.env.get("MCP_ACCESS_KEY");
-  if (!key || key !== expected) {
-    return c.json({ error: "Unauthorized" }, 401);
-  }
-
-  const supabase = createClient(
-    Deno.env.get("SUPABASE_URL")!,
-    Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!,
-  );
-
-  const userId = Deno.env.get("DEFAULT_USER_ID");
-  if (!userId) {
-    return c.json({ error: "DEFAULT_USER_ID not configured" }, 500);
-  }
-
-  const server = new McpServer(
-    { name: "household-knowledge", version: "1.0.0" },
-  );
-
-  // Add household item
-  server.tool(
-    "add_household_item",
-    "Add a new household item (paint color, appliance, measurement, document, etc.)",
-    {
-      name: z.string().describe("Name or description of the item"),
-      category: z.string().optional().describe("Category (e.g. 'paint', 'appliance', 'measurement', 'document')"),
-      location: z.string().optional().describe("Location in the home (e.g. 'Living Room', 'Kitchen')"),
-      details: z.string().optional().describe("Flexible metadata as JSON string (e.g. '{\"brand\": \"Sherwin Williams\", \"color\": \"Sea Salt\"}')"),
-      notes: z.string().optional().describe("Additional notes or context"),
-    },
-    async ({ name, category, location, details, notes }) => {
-      try {
-        const { data, error } = await supabase
-          .from("household_items")
-          .insert({
-            user_id: userId,
-            name,
-            category: category || null,
-            location: location || null,
-            details: details || {},
-            notes: notes || null,
-          })
-          .select()
-          .single();
-
-        if (error) {
-          throw new Error(`Failed to add household item: ${error.message}`);
-        }
-
-        return {
-          content: [{
-            type: "text",
-            text: JSON.stringify({
-              success: true,
-              message: `Added household item: ${name}`,
-              item: data,
-            }, null, 2)
-          }]
-        };
-      } catch (error) {
-        const errorMessage = error instanceof Error ? error.message : String(error);
-        return {
-          content: [{ type: "text", text: JSON.stringify({ success: false, error: errorMessage }) }],
-          isError: true,
-        };
-      }
-    }
-  );
-
-  // Search household items
-  server.tool(
-    "search_household_items",
-    "Search household items by name, category, or location",
-    {
-      query: z.string().optional().describe("Search term (searches name, category, location, and notes)"),
-      category: z.string().optional().describe("Filter by specific category"),
-      location: z.string().optional().describe("Filter by specific location"),
-    },
-    async ({ query, category, location }) => {
-      try {
-        let queryBuilder = supabase
-          .from("household_items")
-          .select("*")
-          .eq("user_id", userId);
-
-        if (category) {
-          queryBuilder = queryBuilder.ilike("category", `%${category}%`);
-        }
-
-        if (location) {
-          queryBuilder = queryBuilder.ilike("location", `%${location}%`);
-        }
-
-        if (query) {
-          queryBuilder = queryBuilder.or(
-            `name.ilike.%${query}%,category.ilike.%${query}%,location.ilike.%${query}%,notes.ilike.%${query}%`
-          );
-        }
-
-        const { data, error } = await queryBuilder.order("created_at", { ascending: false });
-
-        if (error) {
-          throw new Error(`Failed to search household items: ${error.message}`);
-        }
-
-        return {
-          content: [{
-            type: "text",
-            text: JSON.stringify({
-              success: true,
-              count: data.length,
-              items: data,
-            }, null, 2)
-          }]
-        };
-      } catch (error) {
-        const errorMessage = error instanceof Error ? error.message : String(error);
-        return {
-          content: [{ type: "text", text: JSON.stringify({ success: false, error: errorMessage }) }],
-          isError: true,
-        };
-      }
-    }
-  );
-
-  // Get item details
-  server.tool(
-    "get_item_details",
-    "Get full details of a specific household item by ID",
-    {
-      item_id: z.string().describe("Item ID (UUID)"),
-    },
-    async ({ item_id }) => {
-      try {
-        const { data, error } = await supabase
-          .from("household_items")
-          .select("*")
-          .eq("id", item_id)
-          .eq("user_id", userId)
-          .single();
-
-        if (error) {
-          throw new Error(`Failed to get item details: ${error.message}`);
-        }
-
-        if (!data) {
-          throw new Error("Item not found or access denied");
-        }
-
-        return {
-          content: [{
-            type: "text",
-            text: JSON.stringify({
-              success: true,
-              item: data,
-            }, null, 2)
-          }]
-        };
-      } catch (error) {
-        const errorMessage = error instanceof Error ? error.message : String(error);
-        return {
-          content: [{ type: "text", text: JSON.stringify({ success: false, error: errorMessage }) }],
-          isError: true,
-        };
-      }
-    }
-  );
-
-  // Add vendor
-  server.tool(
-    "add_vendor",
-    "Add a service provider (plumber, electrician, landscaper, etc.)",
-    {
-      name: z.string().describe("Vendor name"),
-      service_type: z.string().optional().describe("Type of service (e.g. 'plumber', 'electrician', 'landscaper')"),
-      phone: z.string().optional().describe("Phone number"),
-      email: z.string().optional().describe("Email address"),
-      website: z.string().optional().describe("Website URL"),
-      notes: z.string().optional().describe("Additional notes"),
-      rating: z.number().min(1).max(5).optional().describe("Rating from 1-5"),
-      last_used: z.string().optional().describe("Date last used (YYYY-MM-DD format)"),
-    },
-    async ({ name, service_type, phone, email, website, notes, rating, last_used }) => {
-      try {
-        const { data, error } = await supabase
-          .from("household_vendors")
-          .insert({
-            user_id: userId,
-            name,
-            service_type: service_type || null,
-            phone: phone || null,
-            email: email || null,
-            website: website || null,
-            notes: notes || null,
-            rating: rating || null,
-            last_used: last_used || null,
-          })
-          .select()
-          .single();
-
-        if (error) {
-          throw new Error(`Failed to add vendor: ${error.message}`);
-        }
-
-        return {
-          content: [{
-            type: "text",
-            text: JSON.stringify({
-              success: true,
-              message: `Added vendor: ${name}`,
-              vendor: data,
-            }, null, 2)
-          }]
-        };
-      } catch (error) {
-        const errorMessage = error instanceof Error ? error.message : String(error);
-        return {
-          content: [{ type: "text", text: JSON.stringify({ success: false, error: errorMessage }) }],
-          isError: true,
-        };
-      }
-    }
-  );
-
-  // List vendors
-  server.tool(
-    "list_vendors",
-    "List service providers, optionally filtered by service type",
-    {
-      service_type: z.string().optional().describe("Filter by service type (e.g. 'plumber', 'electrician')"),
-    },
-    async ({ service_type }) => {
-      try {
-        let queryBuilder = supabase
-          .from("household_vendors")
-          .select("*")
-          .eq("user_id", userId);
-
-        if (service_type) {
-          queryBuilder = queryBuilder.ilike("service_type", `%${service_type}%`);
-        }
-
-        const { data, error } = await queryBuilder.order("name", { ascending: true });
-
-        if (error) {
-          throw new Error(`Failed to list vendors: ${error.message}`);
-        }
-
-        return {
-          content: [{
-            type: "text",
-            text: JSON.stringify({
-              success: true,
-              count: data.length,
-              vendors: data,
-            }, null, 2)
-          }]
-        };
-      } catch (error) {
-        const errorMessage = error instanceof Error ? error.message : String(error);
-        return {
-          content: [{ type: "text", text: JSON.stringify({ success: false, error: errorMessage }) }],
-          isError: true,
-        };
-      }
-    }
-  );
-
   const transport = new StreamableHTTPTransport();
   await server.connect(transport);
   return transport.handleRequest(c);
 });
-
 app.get("*", (c) => c.json({ status: "ok", service: "Household Knowledge MCP", version: "1.0.0" }));
-
-Deno.serve(app.fetch);
+Deno.serve({ port: parseInt(Deno.env.get("PORT") ?? "3001") }, app.fetch);

@@ -14,26 +14,36 @@ Usage:
     python import-chatgpt.py path/to/extracted-dir/ [options]
 
 Ingestion modes:
-    Default:              Supabase direct insert (requires SUPABASE_URL,
+    --ingest-local (default): Direct PostgreSQL insert with Ollama embeddings.
+                          Requires DATABASE_URL, OLLAMA_BASE (optional, default localhost)
+    --ingest-endpoint:    Custom HTTP endpoint (requires INGEST_URL, INGEST_KEY)
+    Supabase mode:        Legacy — direct Supabase insert (requires SUPABASE_URL,
                           SUPABASE_SERVICE_ROLE_KEY, OPENROUTER_API_KEY)
-    --ingest-endpoint:    Custom endpoint (requires INGEST_URL, INGEST_KEY)
 
 Options:
     --dry-run              Parse, filter, summarize, but don't ingest
     --after YYYY-MM-DD     Only conversations created after this date
     --before YYYY-MM-DD    Only conversations created before this date
     --limit N              Max conversations to process
-    --model openrouter     LLM backend: openrouter (default) or ollama
-    --ollama-model NAME    Ollama model name (default: qwen3)
+    --model ollama         LLM backend: ollama (default) or openrouter
+    --ollama-model NAME    Ollama model name for summarization (default: llama3.2)
+    --ollama-embed-model   Ollama model for embeddings (default: nomic-embed-text)
     --raw                  Skip summarization, ingest user messages directly
     --verbose              Show full summaries during processing
     --report FILE          Write a markdown report of everything imported
-    --ingest-endpoint      Use INGEST_URL/INGEST_KEY instead of Supabase direct insert
+    --ingest-local         Insert directly into PostgreSQL + Ollama embeddings (default)
+    --ingest-endpoint      Use INGEST_URL/INGEST_KEY instead of local PostgreSQL
+    --ingest-supabase      Use legacy Supabase direct insert
 
 Environment variables:
-    SUPABASE_URL               Supabase project URL (required for default mode)
-    SUPABASE_SERVICE_ROLE_KEY  Supabase service role key (required for default mode)
-    OPENROUTER_API_KEY         OpenRouter API key (required for summarization + embeddings)
+    DATABASE_URL               PostgreSQL connection string (required for --ingest-local)
+    DEFAULT_USER_ID            User ID for thoughts (default: "default")
+    OLLAMA_BASE                Ollama base URL (default: http://localhost:11434)
+    OLLAMA_EMBED_MODEL         Ollama embedding model (default: nomic-embed-text)
+    OLLAMA_LLM_MODEL           Ollama LLM model for summarization (default: llama3.2)
+    OPENROUTER_API_KEY         OpenRouter API key (required with --model openrouter)
+    SUPABASE_URL               Supabase project URL (required with --ingest-supabase)
+    SUPABASE_SERVICE_ROLE_KEY  Supabase service role key (required with --ingest-supabase)
     INGEST_URL                 Custom ingest endpoint URL (required with --ingest-endpoint)
     INGEST_KEY                 Custom ingest endpoint auth key (required with --ingest-endpoint)
 """
@@ -56,6 +66,8 @@ SYNC_LOG_PATH = Path("chatgpt-sync-log.json")
 OPENROUTER_BASE = "https://openrouter.ai/api/v1"
 OLLAMA_BASE = "http://localhost:11434"
 
+DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://openbrain:changeme@localhost:5432/openbrain")
+DEFAULT_USER_ID = os.environ.get("DEFAULT_USER_ID", "default")
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
@@ -381,7 +393,7 @@ def summarize_openrouter(title, date_str, user_text):
         return []
 
 
-def summarize_ollama(title, date_str, user_text, model_name="qwen3"):
+def summarize_ollama(title, date_str, user_text, model_name="llama3.2"):
     """Summarize a conversation using a local Ollama model."""
     truncated = user_text[:6000]
 
@@ -430,7 +442,34 @@ def summarize(title, date_str, user_text, args):
 # ─── Embedding Generation ───────────────────────────────────────────────────
 
 
-def generate_embedding(text):
+def generate_embedding_ollama(text, model_name="nomic-embed-text"):
+    """Generate an embedding via Ollama /api/embed."""
+    truncated = text[:8000]
+    ollama_base = os.environ.get("OLLAMA_BASE", OLLAMA_BASE)
+    embed_model = os.environ.get("OLLAMA_EMBED_MODEL", model_name)
+
+    try:
+        resp = requests.post(
+            f"{ollama_base}/api/embed",
+            json={"model": embed_model, "input": truncated},
+            timeout=60,
+        )
+    except requests.RequestException as e:
+        print(f"   Warning: Ollama embed request failed: {e}")
+        return None
+
+    if resp.status_code != 200:
+        print(f"   Warning: Ollama embed returned {resp.status_code}")
+        return None
+
+    try:
+        return resp.json()["embeddings"][0]
+    except (KeyError, IndexError) as e:
+        print(f"   Warning: Failed to parse Ollama embed response: {e}")
+        return None
+
+
+def generate_embedding_openrouter(text):
     """Generate a 1536-dim embedding via OpenRouter (text-embedding-3-small)."""
     truncated = text[:8000]
 
@@ -457,6 +496,11 @@ def generate_embedding(text):
     except (KeyError, IndexError) as e:
         print(f"   Warning: Failed to parse embedding response: {e}")
         return None
+
+
+# Keep legacy name for Supabase path
+def generate_embedding(text):
+    return generate_embedding_openrouter(text)
 
 
 # ─── Ingestion ───────────────────────────────────────────────────────────────
@@ -494,6 +538,39 @@ def ingest_thought_supabase(content, metadata_dict):
         return {"ok": False, "error": f"HTTP {resp.status_code}: {error_detail}"}
 
     return {"ok": True}
+
+
+def ingest_thought_local(content, metadata_dict, embed_model="nomic-embed-text"):
+    """Insert a thought directly into PostgreSQL using Ollama for embeddings."""
+    try:
+        import psycopg2
+        from pgvector.psycopg2 import register_vector
+    except ImportError:
+        print("Error: psycopg2-binary and pgvector are required for --ingest-local.")
+        print("Install with: pip install psycopg2-binary pgvector")
+        sys.exit(1)
+
+    embedding = generate_embedding_ollama(content, embed_model)
+    if not embedding:
+        return {"ok": False, "error": "Failed to generate Ollama embedding"}
+
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        register_vector(conn)
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO thoughts (user_id, content, embedding, metadata)
+            VALUES (%s, %s, %s, %s)
+            """,
+            (DEFAULT_USER_ID, content, embedding, json.dumps(metadata_dict)),
+        )
+        conn.commit()
+        cur.close()
+        conn.close()
+        return {"ok": True}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
 
 def ingest_thought_endpoint(content, extra_metadata, full_text=None):
@@ -553,12 +630,16 @@ Examples:
     parser.add_argument("--after", type=parse_date, help="Only conversations after YYYY-MM-DD")
     parser.add_argument("--before", type=parse_date, help="Only conversations before YYYY-MM-DD")
     parser.add_argument("--limit", type=int, default=0, help="Max conversations to process (0 = unlimited)")
-    parser.add_argument("--model", choices=["openrouter", "ollama"], default="openrouter", help="LLM backend (default: openrouter)")
-    parser.add_argument("--ollama-model", default="qwen3", help="Ollama model name (default: qwen3)")
+    parser.add_argument("--model", choices=["openrouter", "ollama"], default="ollama", help="LLM backend for summarization (default: ollama)")
+    parser.add_argument("--ollama-model", default=os.environ.get("OLLAMA_LLM_MODEL", "llama3.2"), help="Ollama model name for summarization (default: llama3.2)")
+    parser.add_argument("--ollama-embed-model", default=os.environ.get("OLLAMA_EMBED_MODEL", "nomic-embed-text"), help="Ollama model for embeddings (default: nomic-embed-text)")
     parser.add_argument("--raw", action="store_true", help="Skip summarization, ingest user messages directly")
     parser.add_argument("--verbose", action="store_true", help="Show full summaries during processing")
     parser.add_argument("--report", type=str, metavar="FILE", help="Write a markdown report of everything imported")
-    parser.add_argument("--ingest-endpoint", action="store_true", help="Use INGEST_URL/INGEST_KEY instead of Supabase direct insert")
+    ingest_group = parser.add_mutually_exclusive_group()
+    ingest_group.add_argument("--ingest-local", action="store_true", default=True, help="Insert directly into PostgreSQL + Ollama embeddings (default)")
+    ingest_group.add_argument("--ingest-endpoint", action="store_true", help="Use INGEST_URL/INGEST_KEY HTTP endpoint")
+    ingest_group.add_argument("--ingest-supabase", action="store_true", help="Legacy Supabase direct insert")
     return parser.parse_args()
 
 
@@ -581,22 +662,21 @@ def main():
             if not INGEST_KEY:
                 print("Error: INGEST_KEY environment variable required with --ingest-endpoint.")
                 sys.exit(1)
-        else:
+        elif args.ingest_supabase:
             if not SUPABASE_URL:
-                print("Error: SUPABASE_URL environment variable required.")
-                print("Set it to your Supabase project URL (e.g., https://xxxxx.supabase.co)")
+                print("Error: SUPABASE_URL environment variable required with --ingest-supabase.")
                 sys.exit(1)
             if not SUPABASE_SERVICE_ROLE_KEY:
                 print("Error: SUPABASE_SERVICE_ROLE_KEY environment variable required.")
                 sys.exit(1)
             if not OPENROUTER_API_KEY:
                 print("Error: OPENROUTER_API_KEY required for embedding generation.")
-                print("Get one at https://openrouter.ai/keys")
                 sys.exit(1)
+        # else: --ingest-local (default) — DATABASE_URL has a built-in default
 
     if not args.raw and args.model == "openrouter" and not OPENROUTER_API_KEY:
         print("Error: OPENROUTER_API_KEY environment variable required for summarization.")
-        print("Use --raw to skip summarization, or --model ollama for local inference.")
+        print("Use --raw to skip summarization, or use the default --model ollama.")
         sys.exit(1)
 
     print(f"\nExtracting conversations from {args.zip_path}...")
@@ -610,7 +690,12 @@ def main():
 
     # Display run configuration
     mode = "DRY RUN" if args.dry_run else "LIVE"
-    ingest_mode = "custom endpoint" if args.ingest_endpoint else "Supabase direct insert"
+    if args.ingest_endpoint:
+        ingest_mode = "custom HTTP endpoint"
+    elif args.ingest_supabase:
+        ingest_mode = "Supabase direct insert"
+    else:
+        ingest_mode = f"local PostgreSQL ({DATABASE_URL.split('@')[-1]})"
     summarize_mode = "raw (no summarization)" if args.raw else f"{args.model}"
     if args.model == "ollama" and not args.raw:
         summarize_mode += f" ({args.ollama_model})"
@@ -733,8 +818,10 @@ def main():
                     "source_ref": metadata,
                 }
                 result = ingest_thought_endpoint(content, extra_metadata, full_text=user_text)
-            else:
+            elif args.ingest_supabase:
                 result = ingest_thought_supabase(content, metadata)
+            else:
+                result = ingest_thought_local(content, metadata, embed_model=args.ollama_embed_model)
 
             if result.get("ok"):
                 ingested += 1
@@ -770,24 +857,30 @@ def main():
         print(f"  Ingested:               {ingested}")
         print(f"  Errors:                 {errors}")
 
-    # Cost estimation
-    if not args.raw and processed > 0:
+    # Cost estimation (only meaningful for OpenRouter paths)
+    if args.model == "openrouter" and not args.raw and processed > 0:
         # gpt-4o-mini via OpenRouter: ~$0.15/1M input, ~$0.60/1M output
-        # Rough estimate: avg 800 tokens input per conv, 200 tokens output
         est_input_tokens = processed * 800
         est_output_tokens = processed * 200
         summarize_cost = (est_input_tokens * 0.15 / 1_000_000) + (est_output_tokens * 0.60 / 1_000_000)
     else:
         summarize_cost = 0
 
-    # Embedding cost: $0.02/1M tokens, ~100 tokens per thought
-    embedding_cost = thoughts_generated * 100 * 0.02 / 1_000_000
+    if args.ingest_supabase and thoughts_generated > 0:
+        # OpenRouter text-embedding-3-small: $0.02/1M tokens, ~100 tokens per thought
+        embedding_cost = thoughts_generated * 100 * 0.02 / 1_000_000
+    else:
+        embedding_cost = 0
+
     total_cost = summarize_cost + embedding_cost
-    print(f"  Est. API cost:          ${total_cost:.4f}")
-    if summarize_cost > 0:
-        print(f"    Summarization:        ${summarize_cost:.4f}")
-    if embedding_cost > 0:
-        print(f"    Embeddings:           ${embedding_cost:.4f}")
+    if total_cost > 0:
+        print(f"  Est. API cost:          ${total_cost:.4f}")
+        if summarize_cost > 0:
+            print(f"    Summarization:        ${summarize_cost:.4f}")
+        if embedding_cost > 0:
+            print(f"    Embeddings:           ${embedding_cost:.4f}")
+    else:
+        print(f"  Est. API cost:          $0.0000 (local Ollama)")
     print("─" * 60)
 
     if args.report and report_entries:

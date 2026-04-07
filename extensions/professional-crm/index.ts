@@ -1,442 +1,258 @@
-/**
- * Extension 5: Professional CRM MCP Server (Remote Edge Function)
- *
- * Provides tools for managing professional contacts, interactions, and opportunities:
- * - Contact management with rich metadata
- * - Interaction logging with auto-updating last_contacted
- * - Opportunity/pipeline tracking
- * - Follow-up reminders
- * - Cross-extension integration with core Open Brain thoughts
- */
-
 import { Hono } from "hono";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPTransport } from "@hono/mcp";
 import { z } from "zod";
-import { createClient } from "@supabase/supabase-js";
+import postgres from "npm:postgres@3.4.5";
+import { authMiddleware } from "../../lib/auth.ts";
 
+const sql = postgres(
+  Deno.env.get("DATABASE_URL") ??
+    "postgresql://openbrain:changeme@localhost:5432/openbrain"
+);
+const DEFAULT_USER_ID = Deno.env.get("DEFAULT_USER_ID") ?? "default";
+
+const server = new McpServer({ name: "professional-crm", version: "1.0.0" });
+
+server.registerTool(
+  "add_professional_contact",
+  {
+    title: "Add Professional Contact",
+    description: "Add a new professional contact to your network",
+    inputSchema: {
+      name: z.string(),
+      company: z.string().optional(),
+      title: z.string().optional(),
+      email: z.string().optional(),
+      phone: z.string().optional(),
+      linkedin_url: z.string().optional(),
+      how_we_met: z.string().optional(),
+      tags: z.array(z.string()).optional(),
+      notes: z.string().optional(),
+    },
+  },
+  async ({ name, company, title, email, phone, linkedin_url, how_we_met, tags, notes }) => {
+    try {
+      const [row] = await sql`
+        INSERT INTO professional_contacts
+          (user_id, name, company, title, email, phone, linkedin_url, how_we_met, tags, notes)
+        VALUES (${DEFAULT_USER_ID}, ${name}, ${company ?? null}, ${title ?? null},
+                ${email ?? null}, ${phone ?? null}, ${linkedin_url ?? null},
+                ${how_we_met ?? null},
+                ${tags ? sql.array(tags) : sql`'{}'::text[]`},
+                ${notes ?? null})
+        RETURNING *
+      `;
+      return { content: [{ type: "text" as const, text: JSON.stringify({ success: true, contact: row }, null, 2) }] };
+    } catch (e) {
+      return { content: [{ type: "text" as const, text: JSON.stringify({ success: false, error: (e as Error).message }) }], isError: true };
+    }
+  }
+);
+
+server.registerTool(
+  "search_contacts",
+  {
+    title: "Search Contacts",
+    description: "Search professional contacts by name, company, or tags",
+    inputSchema: {
+      query: z.string().optional().describe("Searches name, company, title, notes"),
+      tags: z.array(z.string()).optional().describe("All tags must match"),
+    },
+  },
+  async ({ query, tags }) => {
+    try {
+      const rows = await sql`
+        SELECT * FROM professional_contacts
+        WHERE user_id = ${DEFAULT_USER_ID}
+          AND (${query ?? null} IS NULL OR (
+                name    ILIKE ${"%" + (query ?? "") + "%"} OR
+                company ILIKE ${"%" + (query ?? "") + "%"} OR
+                title   ILIKE ${"%" + (query ?? "") + "%"} OR
+                notes   ILIKE ${"%" + (query ?? "") + "%"}
+              ))
+          AND (${tags && tags.length ? sql.array(tags) : null}::text[] IS NULL
+               OR ${tags && tags.length ? sql.array(tags) : sql`'{}'::text[]`} <@ tags)
+        ORDER BY name ASC
+      `;
+      return { content: [{ type: "text" as const, text: JSON.stringify({ success: true, count: rows.length, contacts: rows }, null, 2) }] };
+    } catch (e) {
+      return { content: [{ type: "text" as const, text: JSON.stringify({ success: false, error: (e as Error).message }) }], isError: true };
+    }
+  }
+);
+
+server.registerTool(
+  "log_interaction",
+  {
+    title: "Log Interaction",
+    description: "Log an interaction with a contact (automatically updates last_contacted via DB trigger)",
+    inputSchema: {
+      contact_id: z.string().describe("Contact ID (UUID)"),
+      interaction_type: z.enum(["meeting", "email", "call", "coffee", "event", "linkedin", "other"]),
+      occurred_at: z.string().optional().describe("ISO 8601 timestamp (defaults to now)"),
+      summary: z.string(),
+      follow_up_needed: z.boolean().optional(),
+      follow_up_notes: z.string().optional(),
+    },
+  },
+  async ({ contact_id, interaction_type, occurred_at, summary, follow_up_needed, follow_up_notes }) => {
+    try {
+      const [row] = await sql`
+        INSERT INTO contact_interactions
+          (user_id, contact_id, interaction_type, occurred_at, summary, follow_up_needed, follow_up_notes)
+        VALUES (${DEFAULT_USER_ID}, ${contact_id}, ${interaction_type},
+                ${occurred_at ?? null}, ${summary},
+                ${follow_up_needed ?? false}, ${follow_up_notes ?? null})
+        RETURNING *
+      `;
+      return { content: [{ type: "text" as const, text: JSON.stringify({ success: true, interaction: row }, null, 2) }] };
+    } catch (e) {
+      return { content: [{ type: "text" as const, text: JSON.stringify({ success: false, error: (e as Error).message }) }], isError: true };
+    }
+  }
+);
+
+server.registerTool(
+  "get_contact_history",
+  {
+    title: "Get Contact History",
+    description: "Get a contact's full profile, interactions, and opportunities",
+    inputSchema: { contact_id: z.string().describe("Contact ID (UUID)") },
+  },
+  async ({ contact_id }) => {
+    try {
+      const [contact] = await sql`
+        SELECT * FROM professional_contacts WHERE id = ${contact_id} AND user_id = ${DEFAULT_USER_ID}
+      `;
+      if (!contact) throw new Error("Contact not found");
+      const interactions = await sql`
+        SELECT * FROM contact_interactions
+        WHERE contact_id = ${contact_id} AND user_id = ${DEFAULT_USER_ID}
+        ORDER BY occurred_at DESC
+      `;
+      const opportunities = await sql`
+        SELECT * FROM opportunities
+        WHERE contact_id = ${contact_id} AND user_id = ${DEFAULT_USER_ID}
+        ORDER BY created_at DESC
+      `;
+      return { content: [{ type: "text" as const, text: JSON.stringify({ success: true, contact, interactions, opportunities }, null, 2) }] };
+    } catch (e) {
+      return { content: [{ type: "text" as const, text: JSON.stringify({ success: false, error: (e as Error).message }) }], isError: true };
+    }
+  }
+);
+
+server.registerTool(
+  "create_opportunity",
+  {
+    title: "Create Opportunity",
+    description: "Create a new opportunity/deal, optionally linked to a contact",
+    inputSchema: {
+      contact_id: z.string().optional(),
+      title: z.string(),
+      description: z.string().optional(),
+      stage: z.enum(["identified", "in_conversation", "proposal", "negotiation", "won", "lost"]).optional(),
+      value: z.number().optional(),
+      expected_close_date: z.string().optional().describe("YYYY-MM-DD"),
+      notes: z.string().optional(),
+    },
+  },
+  async ({ contact_id, title, description, stage, value, expected_close_date, notes }) => {
+    try {
+      const [row] = await sql`
+        INSERT INTO opportunities
+          (user_id, contact_id, title, description, stage, value, expected_close_date, notes)
+        VALUES (${DEFAULT_USER_ID}, ${contact_id ?? null}, ${title}, ${description ?? null},
+                ${stage ?? "identified"}, ${value ?? null},
+                ${expected_close_date ?? null}, ${notes ?? null})
+        RETURNING *
+      `;
+      return { content: [{ type: "text" as const, text: JSON.stringify({ success: true, opportunity: row }, null, 2) }] };
+    } catch (e) {
+      return { content: [{ type: "text" as const, text: JSON.stringify({ success: false, error: (e as Error).message }) }], isError: true };
+    }
+  }
+);
+
+server.registerTool(
+  "get_follow_ups_due",
+  {
+    title: "Get Follow-ups Due",
+    description: "List contacts with follow-ups due in the next N days",
+    inputSchema: { days_ahead: z.number().optional().describe("Days to look ahead (default 7)") },
+  },
+  async ({ days_ahead = 7 }) => {
+    try {
+      const futureDateStr = new Date(Date.now() + days_ahead * 86400000).toISOString().split("T")[0];
+      const todayStr = new Date().toISOString().split("T")[0];
+      const rows = await sql`
+        SELECT * FROM professional_contacts
+        WHERE user_id = ${DEFAULT_USER_ID}
+          AND follow_up_date IS NOT NULL
+          AND follow_up_date <= ${futureDateStr}::date
+        ORDER BY follow_up_date ASC
+      `;
+      const overdue  = rows.filter((c) => (c.follow_up_date as string) < todayStr);
+      const upcoming = rows.filter((c) => (c.follow_up_date as string) >= todayStr);
+      return { content: [{ type: "text" as const, text: JSON.stringify({ success: true, overdue_count: overdue.length, upcoming_count: upcoming.length, overdue, upcoming }, null, 2) }] };
+    } catch (e) {
+      return { content: [{ type: "text" as const, text: JSON.stringify({ success: false, error: (e as Error).message }) }], isError: true };
+    }
+  }
+);
+
+server.registerTool(
+  "link_thought_to_contact",
+  {
+    title: "Link Thought to Contact",
+    description: "CROSS-EXTENSION: Append a thought from the core Open Brain to a contact's notes",
+    inputSchema: {
+      thought_id: z.string().describe("Thought ID (UUID) from core thoughts table"),
+      contact_id: z.string().describe("Contact ID (UUID)"),
+    },
+  },
+  async ({ thought_id, contact_id }) => {
+    try {
+      const [thought] = await sql`SELECT * FROM thoughts WHERE id = ${thought_id}`;
+      if (!thought) throw new Error("Thought not found");
+      const [contact] = await sql`SELECT * FROM professional_contacts WHERE id = ${contact_id} AND user_id = ${DEFAULT_USER_ID}`;
+      if (!contact) throw new Error("Contact not found");
+      const linkNote = `\n\n[Linked Thought ${new Date().toISOString().split("T")[0]}]: ${thought.content}`;
+      const [updated] = await sql`
+        UPDATE professional_contacts
+        SET notes = COALESCE(notes, '') || ${linkNote}
+        WHERE id = ${contact_id} AND user_id = ${DEFAULT_USER_ID}
+        RETURNING *
+      `;
+      return { content: [{ type: "text" as const, text: JSON.stringify({ success: true, contact: updated }, null, 2) }] };
+    } catch (e) {
+      return { content: [{ type: "text" as const, text: JSON.stringify({ success: false, error: (e as Error).message }) }], isError: true };
+    }
+  }
+);
+
+const corsHeaders = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Headers": "content-type, x-brain-key, accept, mcp-session-id",
+  "Access-Control-Allow-Methods": "GET, POST, OPTIONS, DELETE",
+};
 const app = new Hono();
-
-// POST /mcp - Main MCP endpoint
+app.options("*", (c) => c.text("ok", 200, corsHeaders));
+app.use("*", authMiddleware);
 app.post("*", async (c) => {
-  // Fix: Claude Desktop connectors don't send the Accept header that
-  // StreamableHTTPTransport requires. Build a patched request if missing.
   if (!c.req.header("accept")?.includes("text/event-stream")) {
     const headers = new Headers(c.req.raw.headers);
     headers.set("Accept", "application/json, text/event-stream");
     const patched = new Request(c.req.raw.url, {
-      method: c.req.raw.method,
-      headers,
-      body: c.req.raw.body,
+      method: c.req.raw.method, headers, body: c.req.raw.body,
       // @ts-ignore -- duplex required for streaming body in Deno
       duplex: "half",
     });
     Object.defineProperty(c.req, "raw", { value: patched, writable: true });
   }
-
-
-  // Auth check
-  const key = c.req.query("key") || c.req.header("x-access-key");
-  const expected = Deno.env.get("MCP_ACCESS_KEY");
-  if (!key || key !== expected) {
-    return c.json({ error: "Unauthorized" }, 401);
-  }
-
-  // Initialize Supabase client
-  const supabase = createClient(
-    Deno.env.get("SUPABASE_URL")!,
-    Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!,
-    {
-      auth: {
-        autoRefreshToken: false,
-        persistSession: false,
-      },
-    },
-  );
-
-  const userId = Deno.env.get("DEFAULT_USER_ID");
-  if (!userId) {
-    return c.json({ error: "DEFAULT_USER_ID not configured" }, 500);
-  }
-
-  const server = new McpServer({ name: "professional-crm", version: "1.0.0" });
-
-  // Tool 1: add_professional_contact
-  server.tool(
-    "add_professional_contact",
-    "Add a new professional contact to your network",
-    {
-      name: z.string().describe("Contact's full name"),
-      company: z.string().optional().describe("Company name"),
-      title: z.string().optional().describe("Job title"),
-      email: z.string().optional().describe("Email address"),
-      phone: z.string().optional().describe("Phone number"),
-      linkedin_url: z.string().optional().describe("LinkedIn profile URL"),
-      how_we_met: z.string().optional().describe("How you met this person"),
-      tags: z.array(z.string()).optional().describe("Tags for categorization (e.g., ['ai', 'consulting', 'conference'])"),
-      notes: z.string().optional().describe("Additional notes about this contact"),
-    },
-    async ({ name, company, title, email, phone, linkedin_url, how_we_met, tags, notes }) => {
-      const { data, error } = await supabase
-        .from("professional_contacts")
-        .insert({
-          user_id: userId,
-          name,
-          company: company || null,
-          title: title || null,
-          email: email || null,
-          phone: phone || null,
-          linkedin_url: linkedin_url || null,
-          how_we_met: how_we_met || null,
-          tags: tags || [],
-          notes: notes || null,
-        })
-        .select()
-        .single();
-
-      if (error) {
-        throw new Error(`Failed to add professional contact: ${error.message}`);
-      }
-
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify({
-              success: true,
-              message: `Added professional contact: ${name}`,
-              contact: data,
-            }, null, 2),
-          },
-        ],
-      };
-    },
-  );
-
-  // Tool 2: search_contacts
-  server.tool(
-    "search_contacts",
-    "Search professional contacts by name, company, or tags",
-    {
-      query: z.string().optional().describe("Search term (searches name, company, title, notes)"),
-      tags: z.array(z.string()).optional().describe("Filter by specific tags"),
-    },
-    async ({ query, tags }) => {
-      let queryBuilder = supabase
-        .from("professional_contacts")
-        .select("*")
-        .eq("user_id", userId);
-
-      if (query) {
-        queryBuilder = queryBuilder.or(
-          `name.ilike.%${query}%,company.ilike.%${query}%,title.ilike.%${query}%,notes.ilike.%${query}%`
-        );
-      }
-
-      if (tags && tags.length > 0) {
-        queryBuilder = queryBuilder.contains("tags", tags);
-      }
-
-      const { data, error } = await queryBuilder.order("name", { ascending: true });
-
-      if (error) {
-        throw new Error(`Failed to search contacts: ${error.message}`);
-      }
-
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify({
-              success: true,
-              count: data.length,
-              contacts: data,
-            }, null, 2),
-          },
-        ],
-      };
-    },
-  );
-
-  // Tool 3: log_interaction
-  server.tool(
-    "log_interaction",
-    "Log an interaction with a contact (automatically updates last_contacted)",
-    {
-      contact_id: z.string().describe("Contact ID (UUID)"),
-      interaction_type: z.enum(["meeting", "email", "call", "coffee", "event", "linkedin", "other"]).describe("Type of interaction"),
-      occurred_at: z.string().optional().describe("When the interaction occurred (ISO 8601 timestamp, defaults to now)"),
-      summary: z.string().describe("Summary of the interaction"),
-      follow_up_needed: z.boolean().optional().describe("Whether a follow-up is needed"),
-      follow_up_notes: z.string().optional().describe("Notes about the follow-up"),
-    },
-    async ({ contact_id, interaction_type, occurred_at, summary, follow_up_needed, follow_up_notes }) => {
-      const { data, error } = await supabase
-        .from("contact_interactions")
-        .insert({
-          user_id: userId,
-          contact_id,
-          interaction_type,
-          occurred_at: occurred_at || new Date().toISOString(),
-          summary,
-          follow_up_needed: follow_up_needed || false,
-          follow_up_notes: follow_up_notes || null,
-        })
-        .select()
-        .single();
-
-      if (error) {
-        throw new Error(`Failed to log interaction: ${error.message}`);
-      }
-
-      // Note: last_contacted is automatically updated by database trigger
-
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify({
-              success: true,
-              message: "Interaction logged successfully",
-              interaction: data,
-            }, null, 2),
-          },
-        ],
-      };
-    },
-  );
-
-  // Tool 4: get_contact_history
-  server.tool(
-    "get_contact_history",
-    "Get a contact's full profile and all interactions, ordered by date",
-    {
-      contact_id: z.string().describe("Contact ID (UUID)"),
-    },
-    async ({ contact_id }) => {
-      // Get contact details
-      const { data: contact, error: contactError } = await supabase
-        .from("professional_contacts")
-        .select("*")
-        .eq("id", contact_id)
-        .eq("user_id", userId)
-        .single();
-
-      if (contactError) {
-        throw new Error(`Failed to get contact: ${contactError.message}`);
-      }
-
-      // Get all interactions
-      const { data: interactions, error: interactionsError } = await supabase
-        .from("contact_interactions")
-        .select("*")
-        .eq("contact_id", contact_id)
-        .eq("user_id", userId)
-        .order("occurred_at", { ascending: false });
-
-      if (interactionsError) {
-        throw new Error(`Failed to get interactions: ${interactionsError.message}`);
-      }
-
-      // Get related opportunities
-      const { data: opportunities, error: opportunitiesError } = await supabase
-        .from("opportunities")
-        .select("*")
-        .eq("contact_id", contact_id)
-        .eq("user_id", userId)
-        .order("created_at", { ascending: false });
-
-      if (opportunitiesError) {
-        throw new Error(`Failed to get opportunities: ${opportunitiesError.message}`);
-      }
-
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify({
-              success: true,
-              contact,
-              interactions,
-              opportunities,
-              interaction_count: interactions.length,
-            }, null, 2),
-          },
-        ],
-      };
-    },
-  );
-
-  // Tool 5: create_opportunity
-  server.tool(
-    "create_opportunity",
-    "Create a new opportunity/deal, optionally linked to a contact",
-    {
-      contact_id: z.string().optional().describe("Contact ID (UUID) - optional"),
-      title: z.string().describe("Opportunity title"),
-      description: z.string().optional().describe("Detailed description"),
-      stage: z.enum(["identified", "in_conversation", "proposal", "negotiation", "won", "lost"]).optional().describe("Current stage (defaults to 'identified')"),
-      value: z.number().optional().describe("Estimated value in dollars"),
-      expected_close_date: z.string().optional().describe("Expected close date (YYYY-MM-DD)"),
-      notes: z.string().optional().describe("Additional notes"),
-    },
-    async ({ contact_id, title, description, stage, value, expected_close_date, notes }) => {
-      const { data, error } = await supabase
-        .from("opportunities")
-        .insert({
-          user_id: userId,
-          contact_id: contact_id || null,
-          title,
-          description: description || null,
-          stage: stage || "identified",
-          value: value || null,
-          expected_close_date: expected_close_date || null,
-          notes: notes || null,
-        })
-        .select()
-        .single();
-
-      if (error) {
-        throw new Error(`Failed to create opportunity: ${error.message}`);
-      }
-
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify({
-              success: true,
-              message: `Created opportunity: ${title}`,
-              opportunity: data,
-            }, null, 2),
-          },
-        ],
-      };
-    },
-  );
-
-  // Tool 6: get_follow_ups_due
-  server.tool(
-    "get_follow_ups_due",
-    "List contacts with follow-ups due in the past or next N days",
-    {
-      days_ahead: z.number().optional().describe("Number of days to look ahead (default: 7)"),
-    },
-    async ({ days_ahead }) => {
-      const daysToCheck = days_ahead || 7;
-
-      const today = new Date().toISOString().split('T')[0];
-      const futureDate = new Date();
-      futureDate.setDate(futureDate.getDate() + daysToCheck);
-      const futureDateStr = futureDate.toISOString().split('T')[0];
-
-      const { data, error } = await supabase
-        .from("professional_contacts")
-        .select("*")
-        .eq("user_id", userId)
-        .not("follow_up_date", "is", null)
-        .lte("follow_up_date", futureDateStr)
-        .order("follow_up_date", { ascending: true });
-
-      if (error) {
-        throw new Error(`Failed to get follow-ups: ${error.message}`);
-      }
-
-      // Separate overdue and upcoming
-      const overdue = data.filter(c => c.follow_up_date! < today);
-      const upcoming = data.filter(c => c.follow_up_date! >= today);
-
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify({
-              success: true,
-              overdue_count: overdue.length,
-              upcoming_count: upcoming.length,
-              overdue,
-              upcoming,
-            }, null, 2),
-          },
-        ],
-      };
-    },
-  );
-
-  // Tool 7: link_thought_to_contact (CROSS-EXTENSION BRIDGE)
-  server.tool(
-    "link_thought_to_contact",
-    "CROSS-EXTENSION: Link a thought from your core Open Brain to a professional contact",
-    {
-      thought_id: z.string().describe("Thought ID (UUID) from core Open Brain thoughts table"),
-      contact_id: z.string().describe("Contact ID (UUID)"),
-    },
-    async ({ thought_id, contact_id }) => {
-      // Retrieve the thought from core Open Brain
-      const { data: thought, error: thoughtError } = await supabase
-        .from("thoughts")
-        .select("*")
-        .eq("id", thought_id)
-        .single();
-
-      if (thoughtError) {
-        throw new Error(`Failed to retrieve thought: ${thoughtError.message}`);
-      }
-
-      if (!thought) {
-        throw new Error("Thought not found or access denied");
-      }
-
-      // Get the contact
-      const { data: contact, error: contactError } = await supabase
-        .from("professional_contacts")
-        .select("*")
-        .eq("id", contact_id)
-        .eq("user_id", userId)
-        .single();
-
-      if (contactError) {
-        throw new Error(`Failed to retrieve contact: ${contactError.message}`);
-      }
-
-      // Append the thought to the contact's notes
-      const linkNote = `\n\n[Linked Thought ${new Date().toISOString().split('T')[0]}]: ${thought.content}`;
-      const updatedNotes = (contact.notes || "") + linkNote;
-
-      const { data: updatedContact, error: updateError } = await supabase
-        .from("professional_contacts")
-        .update({ notes: updatedNotes })
-        .eq("id", contact_id)
-        .eq("user_id", userId)
-        .select()
-        .single();
-
-      if (updateError) {
-        throw new Error(`Failed to link thought to contact: ${updateError.message}`);
-      }
-
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify({
-              success: true,
-              message: `Linked thought to contact: ${contact.name}`,
-              thought_content: thought.content,
-              contact: updatedContact,
-            }, null, 2),
-          },
-        ],
-      };
-    },
-  );
-
   const transport = new StreamableHTTPTransport();
   await server.connect(transport);
   return transport.handleRequest(c);
 });
-
-// GET / - Health check
 app.get("*", (c) => c.json({ status: "ok", service: "Professional CRM", version: "1.0.0" }));
-
-Deno.serve(app.fetch);
+Deno.serve({ port: parseInt(Deno.env.get("PORT") ?? "3005") }, app.fetch);
